@@ -3,16 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Plateforme commerciale Uptimum</title>
-<meta name="claude:viewport-fit-sides" content="cover">
+<title>Plateforme commerciale UPTIMUM</title>
+<meta name="description" content="Plateforme commerciale Performance énergétique — Eiffage Énergie Systèmes, DR Sud Alsace (démonstration).">
+<link rel="icon" href="logo-eiffage.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@500;600;700&family=Source+Sans+3:wght@400;600;700&display=swap">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <header class="topbar">
   <div class="brand">
-    <span class="brand-mark" aria-hidden="true">PE</span>
+    <img class="brand-logo" src="logo-eiffage.png" alt="Eiffage Énergie Systèmes" width="128" height="47">
+    <span class="brand-sep" aria-hidden="true"></span>
     <div class="brand-txt">
-      <strong>Plateforme commerciale</strong>
+      <strong>Plateforme commerciale <em>UPTIMUM</em></strong>
       <span>Performance énergétique · DR Sud Alsace</span>
     </div>
   </div>
@@ -29,10 +34,13 @@
     <span id="mode" class="mode">Démarrage…</span>
   </div>
 </header>
-<p class="demo-band">Démonstration avant Power Apps : prix, coefficients CEE et clients « Exemple » sont fictifs.</p>
 <div class="shell">
   <nav id="nav" class="nav" aria-label="Espaces de la plateforme"></nav>
-  <main id="vue" class="vue" tabindex="-1"><p class="muted">Chargement de la démonstration…</p></main>
+  <div class="contenu">
+    <p class="demo-band"><span class="tag-demo">Démo</span>Prototype avant Power Apps : prix, coefficients CEE et clients « Exemple » sont fictifs.</p>
+    <main id="vue" class="vue" tabindex="-1"><p class="muted">Chargement de la plateforme…</p></main>
+    <footer class="pied">Eiffage Énergie Systèmes · DR Sud Alsace · Plateforme commerciale UPTIMUM, version de démonstration</footer>
+  </div>
 </div>
 <div id="toasts" class="toasts" aria-live="polite"></div>
 <script src="seed.js"></script>
