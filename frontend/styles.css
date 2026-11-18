@@ -34,6 +34,7 @@
   --police: "Source Sans 3", "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
   --mono: Consolas, "SFMono-Regular", Menlo, monospace;
   --rayon: 10px;
+  --h-topbar: 66px; /* hauteur de l'en-tête fixe */
   --ombre: 0 1px 2px rgba(15, 18, 23, .05), 0 4px 14px rgba(15, 18, 23, .04);
 }
 
@@ -54,10 +55,11 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 /* ---------- en-tête ---------- */
 .topbar {
-  position: relative; z-index: 5;
-  display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20;
+  height: var(--h-topbar);
+  display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: nowrap;
   background: var(--blanc); border-bottom: 3px solid var(--rouge);
-  padding-block: 10px;
+  padding-block: 0;
   padding-left: max(20px, env(safe-area-inset-left, 0px));
   padding-right: max(20px, env(safe-area-inset-right, 0px));
 }
@@ -81,6 +83,10 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .mode::before { content: ""; position: absolute; left: 10px; top: 50%; width: 7px; height: 7px; margin-top: -3.5px; border-radius: 50%; background: var(--gris); }
 .mode.python { background: var(--bleu-clair); color: var(--bleu); }
 .mode.python::before { background: var(--vert); }
+@media (max-width: 1100px) {
+  .brand-txt span { display: none; }
+  .role-pick > span { display: none; }
+}
 @media (max-width: 560px) {
   .brand-sep, .brand-txt span { display: none; }
   .brand-logo { height: 32px; }
@@ -88,10 +94,11 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 
 /* ---------- coquille ---------- */
-.shell { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: calc(100vh - 66px); }
+.shell { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: calc(100vh - var(--h-topbar)); }
 .nav {
   background: var(--noir); color: #C9CED6;
-  position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto;
+  position: sticky; top: calc(var(--h-topbar) + env(safe-area-inset-top, 0px)); align-self: start;
+  height: calc(100vh - var(--h-topbar)); overflow-y: auto;
   padding-block: 18px; padding-left: max(12px, env(safe-area-inset-left, 0px)); padding-right: 12px;
   display: flex; flex-direction: column; gap: 2px;
 }
@@ -130,9 +137,12 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 
 @media (max-width: 860px) {
+  /* téléphone et petite tablette : seul le menu reste fixé en haut, pour garder de la place */
+  .topbar { position: static; height: auto; flex-wrap: wrap; padding-block: 10px; }
   .shell { grid-template-columns: minmax(0, 1fr); }
   .nav {
-    position: static; height: auto; flex-direction: row; overflow-x: auto; align-items: center;
+    position: sticky; top: env(safe-area-inset-top, 0px); z-index: 15;
+    height: auto; flex-direction: row; overflow-x: auto; align-items: center;
     padding-block: 8px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
   }
   .nav button { white-space: nowrap; flex: none; }
@@ -153,7 +163,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .grille-fiche { display: grid; grid-template-columns: minmax(0, 1fr) 350px; gap: 18px; align-items: start; }
 @media (max-width: 1120px) { .grille-fiche { grid-template-columns: minmax(0, 1fr); } }
 .colonne { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
-.collant { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 14px); }
+.collant { position: sticky; top: calc(var(--h-topbar) + env(safe-area-inset-top, 0px) + 14px); }
 
 /* ---------- indicateurs ---------- */
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
