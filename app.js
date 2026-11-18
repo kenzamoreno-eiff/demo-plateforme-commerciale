@@ -1,0 +1,1170 @@
+/* Plateforme commerciale Performance énergétique : démonstration avant Power Apps.
+ *
+ * Deux modes, choisis automatiquement au démarrage :
+ *  - mode Python : la page est servie par backend/server.py ; les actions passent
+ *    par l'API et sont enregistrées dans SQLite (rôle de SharePoint + Power Automate) ;
+ *  - mode autonome : la page est ouverte seule (double-clic, artefact) ; le même
+ *    moteur tourne dans le navigateur et les données restent dans ce navigateur.
+ *
+ * Les objets `Moteur` et `Actions` ci-dessous sont les jumeaux de
+ * backend/moteur.py et backend/actions.py : garder les deux identiques.
+ */
+(function () {
+  'use strict';
+
+  const SEED = window.SEED;
+  const CLE_STOCKAGE = 'demo-plateforme-' + SEED.version;
+  const CLE_ROLE = 'demo-plateforme-role';
+  const ETAPES = ['A', 'B', 'C', 'D'];
+  const NOMS_ETAPES = {
+    A: 'Audit et diagnostic',
+    B: "Plan pluriannuel d'investissement",
+    C: 'Conception et réalisation',
+    D: 'Exploitation et amélioration continue'
+  };
+
+  /* =========================================================
+   * 1. Utilitaires
+   * ======================================================= */
+  const $ = (sel, racine) => (racine || document).querySelector(sel);
+  const clone = o => JSON.parse(JSON.stringify(o));
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, c => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+  function num(x) {
+    if (x === null || x === undefined || x === '' || typeof x === 'boolean') return null;
+    const n = Number(String(x).replace(',', '.'));
+    return Number.isFinite(n) ? n : null;
+  }
+  const arrondi = x => Math.floor(x * 100 + 0.5) / 100;
+  const norm = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  function fmtEuros(x) {
+    const n = Math.floor((x || 0) + 0.5);
+    return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ' ') + ' €';
+  }
+  const fmtK = x => ((x || 0) / 1000).toLocaleString('fr-FR', { maximumFractionDigits: 1 }) + ' k€';
+  const fmtNombre = x => Number.isInteger(x) ? String(x) : String(Math.round(x * 1e4) / 1e4);
+  const fmtDate = d => /^\d{4}-\d{2}-\d{2}/.test(d || '') ? d.slice(8, 10) + '/' + d.slice(5, 7) + '/' + d.slice(0, 4) + d.slice(10) : (d || '—');
+  const pad = n => String(n).padStart(2, '0');
+  function contexteLocal() {
+    const d = new Date();
+    const jour = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+    return { aujourdhui: jour, maintenant: jour + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()), seed: SEED };
+  }
+
+  /* =========================================================
+   * 2. Moteur (jumeau de backend/moteur.py)
+   * ======================================================= */
+  const Moteur = {
+    derivees(v) {
+      const o = Object.assign({}, v || {});
+      const e = num(o.consoElec), g = num(o.consoGaz);
+      o.consoTotale = (e === null && g === null) ? null : arrondi((e || 0) + (g || 0));
+      return o;
+    },
+    condition(c, v, parc, aujourdhui) {
+      const x = v[c.champ];
+      switch (c.op) {
+        case '>=': { const n = num(x); return n !== null && n >= c.valeur; }
+        case '>': { const n = num(x); return n !== null && n > c.valeur; }
+        case 'entre': { const n = num(x); return n !== null && c.valeur[0] < n && n <= c.valeur[1]; }
+        case 'vrai': return x === true || x === 'oui';
+        case 'contient': return norm(x).includes(norm(c.valeur));
+        case 'plusAncienQue': {
+          if (!x) return true;
+          const limite = String(Number(aujourdhui.slice(0, 4)) - c.valeur) + aujourdhui.slice(4);
+          return String(x) < limite;
+        }
+        case 'possede': return c.valeur.every(t => parc.includes(t));
+        case 'nePossedePas': return c.valeur.every(t => !parc.includes(t));
+        default: return false;
+      }
+    },
+    evaluer(regles, valeurs, parc, aujourdhui, declencheur) {
+      const v = this.derivees(valeurs);
+      return regles.filter(r => r.actif && r.declencheur === declencheur &&
+        r.conditions.every(c => this.condition(c, v, parc, aujourdhui)));
+    },
+    montantAide(aide, saisie, prix) {
+      if (aide.type === 'cee') {
+        const kwhc = aide.coefKwhc * (num(saisie.qte) || 0);
+        return { kwhc: arrondi(kwhc), montant: arrondi(kwhc / 1000 * prix) };
+      }
+      return { kwhc: 0, montant: arrondi(num(saisie.montant) || 0) };
+    },
+    calculer(ch, produits, aides, params) {
+      const prix = {};
+      produits.forEach(p => { prix[p.id] = p.prixAchat; });
+      let materiel = 0;
+      (ch.lignes || []).forEach(l => { materiel += (prix[l.produitId] || 0) * (num(l.qte) || 0); });
+      const mo = num(ch.mainOeuvre) || 0;
+      const cout = arrondi(materiel + mo);
+      let m = num(ch.marge);
+      m = (m === null ? params.margeDefaut : m) / 100;
+
+      const detail = [];
+      let totalAides = 0;
+      (ch.aides || []).forEach(s => {
+        const a = aides.find(x => x.id === s.aideId);
+        if (!a) return;
+        const r = this.montantAide(a, s, params.prixMWhCumac);
+        detail.push({ aideId: a.id, nom: a.nom, kwhc: r.kwhc, montant: r.montant });
+        totalAides += r.montant;
+      });
+      totalAides = arrondi(totalAides);
+
+      let pv, rac, marge;
+      if (ch.base === 'apres') {
+        const b = Math.max(0, cout - totalAides);
+        rac = arrondi(b * (1 + m)); pv = arrondi(rac + totalAides); marge = arrondi(rac - b);
+      } else {
+        pv = arrondi(cout * (1 + m)); rac = arrondi(Math.max(0, pv - totalAides)); marge = arrondi(pv - cout);
+      }
+      const alertes = [];
+      if (totalAides > cout && cout > 0) alertes.push({ niveau: 'critique', message: 'Les aides dépassent le coût du projet : à corriger avant envoi.' });
+      if (rac === 0 && totalAides > 0) alertes.push({ niveau: 'attention', message: 'Reste à charge nul : validation de la cellule 3E obligatoire.' });
+      return { materiel: arrondi(materiel), mainOeuvre: arrondi(mo), cout, pv, totalAides, rac, marge, detailAides: detail, alertes };
+    },
+    interlocuteurs(etape, offre, annuaire) {
+      return annuaire
+        .filter(s => s.etapes.includes(etape) && (!s.offres.length || s.offres.includes(offre)))
+        .map(s => ({ serviceId: s.id, service: s.service, nom: s.nom }));
+    }
+  };
+
+  /* =========================================================
+   * 3. Actions (jumelles de backend/actions.py)
+   * ======================================================= */
+  const LISTES = ['parametres', 'annuaire', 'clients', 'contacts', 'installations', 'produits',
+    'aides', 'regles', 'prediagnostics', 'opportunites', 'affaires', 'journal'];
+
+  function nextId(liste, prefixe, largeur) {
+    let maxi = 0;
+    liste.forEach(it => {
+      if (it.id.startsWith(prefixe)) {
+        const n = parseInt(it.id.slice(prefixe.length), 10);
+        if (!isNaN(n) && n > maxi) maxi = n;
+      }
+    });
+    return prefixe + String(maxi + 1).padStart(largeur, '0');
+  }
+  function trouver(liste, id, quoi) {
+    const x = liste.find(i => i.id === id);
+    if (!x) throw new Error(quoi + ' introuvable : ' + id);
+    return x;
+  }
+  function journaliser(st, ctx, flux, message, niveau) {
+    st.journal.push({ id: nextId(st.journal, 'J-', 4), date: ctx.maintenant, flux, message, niveau: niveau || 'auto' });
+  }
+  function parcClient(st, clientId) {
+    const vus = [];
+    st.installations.forEach(i => { if (i.clientId === clientId && !vus.includes(i.type)) vus.push(i.type); });
+    return vus;
+  }
+  function recalculer(st, a) { a.resultat = Moteur.calculer(a.chiffrage, st.produits, st.aides, st.parametres); }
+  function creerOpps(st, ctx, clientId, prediagId, regles) {
+    const crees = [];
+    regles.forEach(r => {
+      const deja = st.opportunites.some(o => o.clientId === clientId && o.regleId === r.id && o.statut !== 'Écartée');
+      if (deja) return;
+      const o = {
+        id: nextId(st.opportunites, 'OPP-', 4), clientId, prediagId, regleId: r.id, titre: r.titre, offre: r.offre,
+        priorite: r.priorite, echeance: r.echeance, statut: 'Nouvelle', origine: 'Règle ' + r.id, date: ctx.aujourdhui
+      };
+      st.opportunites.push(o);
+      crees.push(o.id);
+    });
+    return crees;
+  }
+  function etatInitial(seed) {
+    const st = {};
+    LISTES.forEach(k => { st[k] = clone(seed[k]); });
+    st.version = seed.version;
+    st.affaires.forEach(a => {
+      recalculer(st, a);
+      a.interlocuteurs = Moteur.interlocuteurs(a.etape, a.offre, st.annuaire);
+    });
+    return st;
+  }
+  function lireCSV(texte) {
+    texte = texte.replace(/^﻿/, '');
+    const premiere = texte.split(/\r?\n/)[0] || '';
+    const sep = premiere.split(';').length >= premiere.split(',').length ? ';' : ',';
+    const lignes = [];
+    let ligne = [], champ = '', guil = false;
+    const finLigne = () => { ligne.push(champ); champ = ''; if (ligne.some(x => x.trim() !== '')) lignes.push(ligne); ligne = []; };
+    for (let i = 0; i < texte.length; i++) {
+      const ch = texte[i];
+      if (guil) {
+        if (ch === '"') { if (texte[i + 1] === '"') { champ += '"'; i++; } else guil = false; }
+        else champ += ch;
+      } else if (ch === '"') guil = true;
+      else if (ch === sep) { ligne.push(champ); champ = ''; }
+      else if (ch === '\n' || ch === '\r') { if (ch === '\r' && texte[i + 1] === '\n') i++; finLigne(); }
+      else champ += ch;
+    }
+    finLigne();
+    return lignes;
+  }
+
+  const Actions = {
+    enregistrerPrediag(st, p, ctx) {
+      const c = trouver(st.clients, p.clientId, 'Client');
+      const id = nextId(st.prediagnostics, 'PD-', 4);
+      const ref = p.ref || id;
+      const valeurs = p.valeurs || {};
+      st.prediagnostics.push({ id, ref, clientId: c.id, date: p.date || ctx.aujourdhui, auditeur: p.auditeur || '', energyExpert: p.energyExpert || '', valeurs });
+      const regles = Moteur.evaluer(st.regles, valeurs, parcClient(st, c.id), ctx.aujourdhui, 'prediag');
+      const crees = creerOpps(st, ctx, c.id, id, regles);
+      journaliser(st, ctx, "Règles d'opportunités", `${c.nom} : pré-diagnostic ${ref} analysé, ${crees.length} opportunité(s) créée(s).`);
+      if (crees.length) journaliser(st, ctx, 'Notifications', `Energy Expert prévenu : ${crees.length} opportunité(s) à valider pour ${c.nom}.`);
+      return { prediagId: id, crees, reglesDeclenchees: regles.map(r => r.id) };
+    },
+    ajouterInstallation(st, p, ctx) {
+      const c = trouver(st.clients, p.clientId, 'Client');
+      if (!p.type) throw new Error("Choisissez le type d'installation.");
+      const id = nextId(st.installations, 'INS-', 4);
+      const annee = num(p.annee);
+      st.installations.push({ id, clientId: c.id, type: p.type, puissance: num(p.puissance), unite: p.unite || '', annee: annee === null ? null : Math.trunc(annee), marque: p.marque || '', note: p.note || '' });
+      const regles = Moteur.evaluer(st.regles, {}, parcClient(st, c.id), ctx.aujourdhui, 'parc');
+      const crees = creerOpps(st, ctx, c.id, null, regles);
+      if (crees.length) journaliser(st, ctx, 'Ventes complémentaires', `${c.nom} : ${p.type} ajouté au parc, ${crees.length} opportunité(s) de vente complémentaire.`);
+      return { installationId: id, crees };
+    },
+    statutOpportunite(st, p, ctx) {
+      const o = trouver(st.opportunites, p.id, 'Opportunité');
+      if (!['Nouvelle', 'Validée', 'Écartée'].includes(p.statut)) throw new Error('Statut non autorisé.');
+      o.statut = p.statut;
+      if (p.statut === 'Validée') {
+        const c = trouver(st.clients, o.clientId, 'Client');
+        journaliser(st, ctx, 'Notifications', `Responsable d'affaires prévenu : « ${o.titre} » validée pour ${c.nom}.`);
+      }
+      return {};
+    },
+    creerAffaire(st, p, ctx) {
+      let o = null, clientId = p.clientId, titre = p.titre, offre = p.offre;
+      if (p.oppId) { o = trouver(st.opportunites, p.oppId, 'Opportunité'); clientId = o.clientId; titre = o.titre; offre = o.offre; }
+      const c = trouver(st.clients, clientId, 'Client');
+      const id = nextId(st.affaires, 'AFF-' + ctx.aujourdhui.slice(0, 4) + '-', 3);
+      const a = {
+        id, clientId: c.id, oppId: o ? o.id : null, titre, offre, etape: 'A', avancement: 0, reserve: '',
+        chiffrage: { lignes: [], mainOeuvre: 0, marge: st.parametres.margeDefaut, base: 'avant', aides: [] },
+        resultat: null, interlocuteurs: Moteur.interlocuteurs('A', offre, st.annuaire),
+        historique: [{ date: ctx.maintenant, texte: 'Affaire créée' + (o ? ' depuis ' + o.id : '') }]
+      };
+      recalculer(st, a);
+      st.affaires.push(a);
+      if (o) o.statut = 'En affaire';
+      journaliser(st, ctx, 'Affectation et notifications', `${id} créée pour ${c.nom} : ${a.interlocuteurs.map(i => i.service).join(', ')} prévenu(s).`);
+      return { affaireId: id };
+    },
+    majChiffrage(st, p, ctx) {
+      const a = trouver(st.affaires, p.id, 'Affaire');
+      a.chiffrage = p.chiffrage || a.chiffrage;
+      recalculer(st, a);
+      a.historique.push({ date: ctx.maintenant, texte: 'Chiffrage enregistré : reste à charge ' + fmtEuros(a.resultat.rac) });
+      if (a.resultat.rac === 0 && a.resultat.totalAides > 0) {
+        journaliser(st, ctx, 'Alerte reste à charge nul', `${a.id} : reste à charge nul, cellule 3E prévenue pour validation.`, 'alerte');
+      }
+      return {};
+    },
+    majChantier(st, p, ctx) {
+      const a = trouver(st.affaires, p.id, 'Affaire');
+      a.avancement = Math.max(0, Math.min(100, Math.floor((num(p.avancement) || 0) + 0.5)));
+      a.reserve = p.reserve || '';
+      a.historique.push({ date: ctx.maintenant, texte: `Avancement chantier : ${a.avancement} %` });
+      if (a.reserve) journaliser(st, ctx, 'Notifications', `${a.id} : réserve signalée par le conducteur de travaux, responsable d'affaires prévenu.`);
+      return {};
+    },
+    changerEtape(st, p, ctx) {
+      const a = trouver(st.affaires, p.id, 'Affaire');
+      if (!ETAPES.includes(p.etape)) throw new Error('Étape inconnue.');
+      const avant = a.etape;
+      a.etape = p.etape;
+      a.interlocuteurs = Moteur.interlocuteurs(p.etape, a.offre, st.annuaire);
+      if (p.etape === 'D' && avant === 'C') a.avancement = 100;
+      a.historique.push({ date: ctx.maintenant, texte: `Étape ${avant} → ${p.etape}` });
+      const noms = a.interlocuteurs.map(i => i.service).join(', ') || 'aucun service';
+      journaliser(st, ctx, 'Affectation et notifications', `${a.id} passe en étape ${p.etape} : ${noms} prévenu(s).`);
+      return {};
+    },
+    majParametres(st, p, ctx) {
+      ['margeDefaut', 'prixMWhCumac'].forEach(k => {
+        if (k in p) {
+          const v = num(p[k]);
+          if (v === null || v < 0) throw new Error('Valeur invalide : ' + k);
+          st.parametres[k] = v;
+        }
+      });
+      const pa = st.parametres;
+      journaliser(st, ctx, 'Paramètres', `Marge par défaut ${fmtNombre(pa.margeDefaut)} %, prix du MWh cumac ${fmtNombre(pa.prixMWhCumac)} €.`, 'info');
+      return {};
+    },
+    majRegle(st, p, ctx) {
+      const r = trouver(st.regles, p.id, 'Règle');
+      if ('actif' in p) r.actif = !!p.actif;
+      if ('seuil' in p) {
+        const c = r.conditions.find(c => typeof c.valeur === 'number');
+        const v = num(p.seuil);
+        if (!c || v === null) throw new Error('Seuil non modifiable pour cette règle.');
+        c.valeur = v;
+      }
+      journaliser(st, ctx, 'Paramètres', `Règle ${r.id} mise à jour.`, 'info');
+      return {};
+    },
+    importerClients(st, p, ctx) {
+      const lignes = lireCSV(p.csv || '');
+      if (lignes.length < 2) throw new Error("Fichier vide ou sans ligne d'en-tête.");
+      const entete = lignes[0].map(h => norm(h).trim());
+      const col = noms => entete.findIndex(h => noms.includes(h));
+      const idx = {
+        nom: col(['nom', 'raison sociale', 'client']), site: col(['site', 'ville']), adresse: col(['adresse']),
+        lat: col(['lat', 'latitude']), lon: col(['lon', 'lng', 'longitude']), secteur: col(['secteur']),
+        statut: col(['statut']), agence: col(['agence'])
+      };
+      if (idx.nom < 0) throw new Error("Colonne « nom » introuvable dans l'en-tête.");
+      let n = 0;
+      lignes.slice(1).forEach(l => {
+        const g = k => (idx[k] >= 0 && idx[k] < l.length ? l[idx[k]] : '').trim();
+        if (!g('nom')) return;
+        st.clients.push({
+          id: nextId(st.clients, 'CLI-', 4), nom: g('nom'), site: g('site'), adresse: g('adresse'),
+          lat: num(g('lat')), lon: num(g('lon')), secteur: g('secteur'),
+          statut: norm(g('statut')).startsWith('client') ? 'Client' : 'Prospect', agence: g('agence')
+        });
+        n++;
+      });
+      journaliser(st, ctx, 'Import', `${n} client(s) importé(s) depuis le fichier Excel (CSV).`, 'info');
+      return { importes: n };
+    },
+    reinitialiser(st, p, ctx) {
+      const neuf = etatInitial(ctx.seed);
+      Object.keys(st).forEach(k => { delete st[k]; });
+      Object.assign(st, neuf);
+      return {};
+    }
+  };
+
+  /* =========================================================
+   * 4. Stockage : mode Python ou mode autonome
+   * ======================================================= */
+  const Stockage = {
+    mode: 'autonome',
+    etat: null,
+    async demarrer() {
+      if (/^https?:$/.test(location.protocol)) {
+        try {
+          const ctl = new AbortController();
+          const t = setTimeout(() => ctl.abort(), 1500);
+          const r = await fetch('/api/health', { signal: ctl.signal, cache: 'no-store' });
+          clearTimeout(t);
+          if (r.ok) {
+            const j = await r.json();
+            if (j && j.mode === 'python') {
+              const e = await fetch('/api/etat', { cache: 'no-store' });
+              this.etat = await e.json();
+              this.mode = 'python';
+              return;
+            }
+          }
+        } catch (err) { /* pas de serveur : mode autonome */ }
+      }
+      this.mode = 'autonome';
+      this.etat = this.lireLocal() || etatInitial(SEED);
+      this.ecrireLocal();
+    },
+    lireLocal() {
+      try {
+        const s = localStorage.getItem(CLE_STOCKAGE);
+        if (!s) return null;
+        const e = JSON.parse(s);
+        return e && e.version === SEED.version ? e : null;
+      } catch (err) { return null; }
+    },
+    ecrireLocal() {
+      try { localStorage.setItem(CLE_STOCKAGE, JSON.stringify(this.etat)); } catch (err) { /* stockage indisponible */ }
+    },
+    async action(nom, payload) {
+      if (this.mode === 'python') {
+        const r = await fetch('/api/action/' + nom, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload || {})
+        });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.erreur || 'Erreur du serveur');
+        this.etat = j.etat;
+        delete j.etat;
+        return j;
+      }
+      const copie = clone(this.etat);           // l'état ne change que si l'action réussit
+      const res = Actions[nom](copie, payload || {}, contexteLocal());
+      this.etat = copie;
+      this.ecrireLocal();
+      return res;
+    }
+  };
+
+  /* =========================================================
+   * 5. État de l'interface et petits composants
+   * ======================================================= */
+  const ui = {
+    vue: 'accueil',
+    role: lireRole(),
+    clientId: null, ongletClient: 'infos',
+    affaireId: null, brouillon: null, brouillonPour: null, modifie: false,
+    prediag: null, dernierPrediag: null,
+    filtresClients: { q: '', statut: '', agence: '' },
+    filtresOpp: { statut: '', offre: '' },
+    confirmerReset: false
+  };
+  function lireRole() { try { return localStorage.getItem(CLE_ROLE) || "Responsable d'affaires"; } catch (e) { return "Responsable d'affaires"; } }
+  function ecrireRole(r) { try { localStorage.setItem(CLE_ROLE, r); } catch (e) { /* rien */ } }
+
+  const E = () => Stockage.etat;
+  const client = id => E().clients.find(c => c.id === id) || { nom: '?', site: '' };
+  const produit = id => E().produits.find(p => p.id === id);
+
+  function badgeStatut(s) {
+    const cls = { 'Nouvelle': 'orange', 'Validée': 'bleu', 'En affaire': 'vert', 'Écartée': 'barre' }[s] || '';
+    const lib = s === 'Nouvelle' ? 'À valider' : s;
+    return `<span class="badge ${cls}">${esc(lib)}</span>`;
+  }
+  function badgePrio(p) {
+    const cls = { Haute: 'rouge', Moyenne: 'bleu' }[p] || '';
+    return `<span class="badge ${cls}">${esc(p)}</span>`;
+  }
+  const badgeOffre = o => `<span class="badge bleu">${esc(o)}</span>`;
+  const badgeClient = s => `<span class="badge ${s === 'Client' ? 'vert' : ''}">${esc(s)}</span>`;
+  function lettre(etape, courante) {
+    const i = ETAPES.indexOf(etape), j = ETAPES.indexOf(courante);
+    const cls = i < j ? 'fait' : (i === j ? '' : 'futur');
+    return `<span class="etape-lettre ${cls}">${etape}</span>`;
+  }
+  function carte(titre, contenu, outils) {
+    return `<section class="carte"><div class="carte-head"><h2>${titre}</h2>${outils ? `<div class="actions">${outils}</div>` : ''}</div>${contenu}</section>`;
+  }
+  const vide = t => `<p class="vide">${esc(t)}</p>`;
+  const nomChamp = id => {
+    if (id === 'consoTotale') return { label: 'Consommation totale (électricité + gaz)', unite: 'GWh/an' };
+    if (id === 'parc') return { label: 'Parc installé', unite: '' };
+    return SEED.questions.find(q => q.id === id) || { label: id, unite: '' };
+  };
+  function texteCondition(c) {
+    const q = nomChamp(c.champ), u = q.unite ? ' ' + q.unite : '';
+    switch (c.op) {
+      case '>=': return `${q.label} ≥ ${fmtNombre(c.valeur)}${u}`;
+      case '>': return `${q.label} > ${fmtNombre(c.valeur)}${u}`;
+      case 'entre': return `${q.label} entre ${c.valeur[0]} et ${c.valeur[1]}${u}`;
+      case 'vrai': return `${q.label} : oui`;
+      case 'contient': return `${q.label} contient « ${c.valeur} »`;
+      case 'plusAncienQue': return `${q.label} absente ou de plus de ${c.valeur} ans`;
+      case 'possede': return `${q.label} comprend ${c.valeur.join(' + ')}`;
+      case 'nePossedePas': return `${q.label} sans ${c.valeur.join(', ')}`;
+      default: return c.champ;
+    }
+  }
+
+  /* =========================================================
+   * 6. Vues
+   * ======================================================= */
+  const MENU = [
+    ['accueil', 'Accueil'], ['clients', 'Clients'], ['prediags', 'Pré-diagnostics'],
+    ['opportunites', 'Opportunités'], ['affaires', 'Affaires'], null,
+    ['annuaire', 'Annuaire'], ['parametres', 'Paramètres'], ['automatisations', 'Automatisations']
+  ];
+  function rendreNav() {
+    const e = E();
+    const compteurs = {
+      opportunites: e.opportunites.filter(o => o.statut === 'Nouvelle').length,
+      affaires: e.affaires.filter(a => a.etape !== 'D').length,
+      automatisations: e.journal.length
+    };
+    $('#nav').innerHTML = MENU.map(m => {
+      if (!m) return '<span class="sep" aria-hidden="true"></span>';
+      const [id, lib] = m;
+      const n = compteurs[id];
+      return `<button type="button" data-act="vue" data-vue="${id}" ${ui.vue === id ? 'aria-current="page"' : ''}>
+        <span>${lib}</span>${n ? `<span class="compteur">${n}</span>` : ''}</button>`;
+    }).join('');
+    const mode = $('#mode');
+    mode.className = 'mode' + (Stockage.mode === 'python' ? ' python' : '');
+    mode.textContent = Stockage.mode === 'python' ? 'Python connecté · SQLite' : 'Mode autonome · navigateur';
+    $('#role').value = ui.role;
+  }
+
+  /* ---------- Accueil (selon le profil) ---------- */
+  function vueAccueil() {
+    const e = E();
+    const nouv = e.opportunites.filter(o => o.statut === 'Nouvelle');
+    const enCours = e.affaires.filter(a => a.etape !== 'D');
+    const pipeline = enCours.reduce((s, a) => s + a.resultat.pv, 0);
+    const aides = e.affaires.reduce((s, a) => s + a.resultat.totalAides, 0);
+    const nbClients = e.clients.filter(c => c.statut === 'Client').length;
+    const kpis = `<div class="kpis">
+      <div class="kpi"><div class="lib">Clients et prospects</div><div class="val">${e.clients.length}</div><div class="det">${nbClients} clients · ${e.clients.length - nbClients} prospects</div></div>
+      <div class="kpi ${nouv.length ? 'alerte' : ''}"><div class="lib">Opportunités à valider</div><div class="val">${nouv.length}</div><div class="det">détectées par les règles</div></div>
+      <div class="kpi"><div class="lib">Pipeline en cours</div><div class="val">${fmtK(pipeline)}</div><div class="det">${enCours.length} affaire(s), étapes A à C</div></div>
+      <div class="kpi"><div class="lib">Aides chiffrées</div><div class="val">${fmtK(aides)}</div><div class="det">CEE et subventions</div></div>
+    </div>`;
+    const blocs = {
+      "Responsable d'affaires": accueilRA, 'Energy Expert': accueilEE, 'Conducteur de travaux': accueilConducteur,
+      'Cellule 3E': accueil3E, 'Direction de la DR': accueilDirection
+    };
+    const intro = {
+      "Responsable d'affaires": 'Vos opportunités validées à chiffrer et vos affaires par étape.',
+      'Energy Expert': 'Les opportunités détectées par les règles attendent votre validation.',
+      'Conducteur de travaux': 'Vos chantiers en étape C : avancement, réserves, réception.',
+      'Cellule 3E': 'Aides chiffrées, restes à charge à valider et paramètres CEE.',
+      'Direction de la DR': 'Pipeline, part UPTIMUM des commandes et opportunités par offre.'
+    };
+    return `<div class="page-head"><div><h1>Accueil · ${esc(ui.role)}</h1><p class="sous">${intro[ui.role]}</p></div>
+      <div class="actions"><button class="btn" data-act="nouveauPrediag">Nouveau pré-diagnostic</button></div></div>
+      ${ui.role === 'Conducteur de travaux' ? '' : kpis}
+      ${blocs[ui.role]()}`;
+  }
+
+  function tableOpps(liste, opts) {
+    if (!liste.length) return vide(opts && opts.vide || 'Aucune opportunité.');
+    return `<div class="table-wrap"><table><thead><tr><th>Client</th><th>Opportunité</th><th>Offre</th><th>Priorité</th><th>Échéance</th><th>Statut</th><th></th></tr></thead><tbody>
+      ${liste.map(o => `<tr>
+        <td>${esc(client(o.clientId).nom)}<span class="sous-ligne">${esc(client(o.clientId).site)}</span></td>
+        <td>${esc(o.titre)}<span class="sous-ligne">${esc(o.origine)} · ${fmtDate(o.date)}</span></td>
+        <td>${badgeOffre(o.offre)}</td><td>${badgePrio(o.priorite)}</td><td>${esc(o.echeance)}</td>
+        <td>${badgeStatut(o.statut)}</td><td><div class="actions">${actionsOpp(o)}</div></td></tr>`).join('')}
+    </tbody></table></div>`;
+  }
+  function actionsOpp(o) {
+    if (o.statut === 'Nouvelle') return `<button class="btn petit" data-act="statutOpp" data-id="${o.id}" data-statut="Validée">Valider</button><button class="btn petit discret" data-act="statutOpp" data-id="${o.id}" data-statut="Écartée">Écarter</button>`;
+    if (o.statut === 'Validée') return `<button class="btn petit" data-act="chiffrerOpp" data-id="${o.id}">Chiffrer</button>`;
+    if (o.statut === 'En affaire') {
+      const a = E().affaires.find(x => x.oppId === o.id);
+      return a ? `<button class="btn petit discret" data-act="ouvrirAffaire" data-id="${a.id}">Voir ${a.id}</button>` : '';
+    }
+    return `<button class="btn petit discret" data-act="statutOpp" data-id="${o.id}" data-statut="Nouvelle">Rétablir</button>`;
+  }
+  function resumeEtapes() {
+    const e = E();
+    return `<div class="kanban">${ETAPES.map(et => {
+      const aff = e.affaires.filter(a => a.etape === et);
+      return `<div class="colonne-k"><header>${lettre(et, et)}<div><div class="t">${NOMS_ETAPES[et]}</div><div class="s">${aff.length} affaire(s) · ${fmtK(aff.reduce((s, a) => s + a.resultat.pv, 0))}</div></div></header>
+        ${aff.map(carteAffaire).join('') || '<p class="muted small">Aucune affaire</p>'}</div>`;
+    }).join('')}</div>`;
+  }
+  function accueilRA() {
+    const e = E();
+    return carte('Opportunités validées, à chiffrer', tableOpps(e.opportunites.filter(o => o.statut === 'Validée'), { vide: "Aucune opportunité validée pour l'instant." }))
+      + carte('Affaires par étape UPTIMUM', resumeEtapes(), `<button class="btn petit discret" data-act="vue" data-vue="affaires">Ouvrir les affaires</button>`);
+  }
+  function accueilEE() {
+    const e = E();
+    const pds = e.prediagnostics.slice().reverse().slice(0, 5);
+    return carte('Opportunités à valider', tableOpps(e.opportunites.filter(o => o.statut === 'Nouvelle'), { vide: 'Rien à valider.' }))
+      + carte('Derniers pré-diagnostics', pds.length ? `<ul class="liste-simple">${pds.map(p => {
+        const n = e.opportunites.filter(o => o.prediagId === p.id).length;
+        return `<li><span><strong>${esc(client(p.clientId).nom)}</strong> · ${esc(p.ref)}<span class="sous-ligne muted">${fmtDate(p.date)} · ${esc(p.auditeur)}</span></span><span class="badge bleu">${n} opportunité(s)</span></li>`;
+      }).join('')}</ul>` : vide('Aucun pré-diagnostic.'));
+  }
+  function accueilConducteur() {
+    const aff = E().affaires.filter(a => a.etape === 'C');
+    if (!aff.length) return carte('Chantiers en cours', vide('Aucune affaire en étape C.'));
+    return aff.map(a => carte(`${esc(a.titre)} · ${esc(client(a.clientId).nom)}`, blocChantier(a, true), `<button class="btn petit discret" data-act="ouvrirAffaire" data-id="${a.id}">Ouvrir ${a.id}</button>`)).join('');
+  }
+  function blocChantier(a, avecMateriel) {
+    const c = client(a.clientId);
+    const mat = a.chiffrage.lignes.map(l => { const p = produit(l.produitId); return p ? `<li><span>${esc(p.designation)}<span class="sous-ligne muted">${esc(p.marque)} · ${esc(p.reference)}</span></span><span class="num">× ${esc(l.qte)}</span></li>` : ''; }).join('');
+    return `<div class="grille-2">
+      <div class="colonne">
+        <p><strong>Site :</strong> ${esc(c.adresse || c.site)}</p>
+        <p><strong>Interlocuteurs :</strong> ${a.interlocuteurs.map(i => esc(i.service)).join(', ') || '—'}</p>
+        ${avecMateriel ? `<div><h3>Matériel</h3><ul class="liste-simple">${mat || '<li class="muted">Aucune ligne de matériel</li>'}</ul></div>` : ''}
+      </div>
+      <div class="colonne">
+        <label class="champ" for="av-${a.id}"><span>Avancement : <output id="avo-${a.id}">${a.avancement}</output> %</span>
+          <input type="range" min="0" max="100" step="5" id="av-${a.id}" value="${a.avancement}" data-input="avancement" data-id="${a.id}"></label>
+        <div class="barre-av" aria-hidden="true"><span id="avb-${a.id}" style="width:${a.avancement}%"></span></div>
+        <label class="champ" for="res-${a.id}"><span>Réserve ou aléa</span><textarea id="res-${a.id}" placeholder="Ex. : livraison des compteurs décalée">${esc(a.reserve)}</textarea></label>
+        <div class="actions">
+          <button class="btn" data-act="enregistrerChantier" data-id="${a.id}">Enregistrer l'avancement</button>
+          ${a.etape === 'C' ? `<button class="btn" data-act="etape" data-id="${a.id}" data-etape="D">Réception : passer en D</button>` : ''}
+        </div>
+      </div></div>`;
+  }
+  function accueil3E() {
+    const e = E();
+    const alertes = e.affaires.filter(a => a.resultat.alertes.length);
+    const lignes = [];
+    e.affaires.forEach(a => a.resultat.detailAides.forEach(d => lignes.push({ a, d })));
+    return carte('Restes à charge et aides à contrôler', alertes.length ? alertes.map(a => `<div class="alerte ${a.resultat.alertes[0].niveau}">${a.id} · ${esc(client(a.clientId).nom)} : ${esc(a.resultat.alertes.map(x => x.message).join(' '))}</div>`).join('') : `<div class="alerte ok">Aucune alerte : aucun reste à charge nul, aucune aide supérieure au coût.</div>`)
+      + carte('Aides chiffrées par affaire', lignes.length ? `<div class="table-wrap"><table><thead><tr><th>Affaire</th><th>Aide</th><th class="montant">kWh cumac</th><th class="montant">Montant</th></tr></thead><tbody>
+        ${lignes.map(({ a, d }) => `<tr class="cliquable" data-act="ouvrirAffaire" data-id="${a.id}"><td>${a.id}<span class="sous-ligne">${esc(client(a.clientId).nom)}</span></td><td>${esc(d.nom)}</td><td class="montant">${d.kwhc ? Math.round(d.kwhc).toLocaleString('fr-FR') : '—'}</td><td class="montant">${fmtEuros(d.montant)}</td></tr>`).join('')}
+      </tbody></table></div>` : vide('Aucune aide chiffrée.'), `<button class="btn petit discret" data-act="vue" data-vue="parametres">Prix du MWh cumac : ${fmtNombre(e.parametres.prixMWhCumac)} €</button>`);
+  }
+  function accueilDirection() {
+    const e = E();
+    const parEtape = ETAPES.map(et => ({ et, v: e.affaires.filter(a => a.etape === et).reduce((s, a) => s + a.resultat.pv, 0) }));
+    const maxi = Math.max(1, ...parEtape.map(x => x.v));
+    const pa = e.parametres;
+    const echelle = Math.max(15, pa.partUptimumMoyenne * 1.15);
+    const offres = {};
+    e.opportunites.filter(o => o.statut !== 'Écartée').forEach(o => { offres[o.offre] = (offres[o.offre] || 0) + 1; });
+    const maxO = Math.max(1, ...Object.values(offres));
+    return `<div class="grille-2">
+      ${carte('Part UPTIMUM des commandes', `<div class="barres">
+        <div class="barre-ligne"><span>DR Sud Alsace</span><span class="piste"><span style="width:${pa.partUptimumDR / echelle * 100}%"></span></span><span class="v">${fmtNombre(pa.partUptimumDR)} %</span></div>
+        <div class="barre-ligne"><span>Moyenne des DR</span><span class="piste"><span class="moy" style="width:${pa.partUptimumMoyenne / echelle * 100}%"></span></span><span class="v">${fmtNombre(pa.partUptimumMoyenne)} %</span></div>
+      </div><p class="muted small" style="margin-top:10px">Objectif : rejoindre la moyenne en chiffrant les affaires dès le pré-diagnostic.</p>`)}
+      ${carte('Pipeline par étape (prix de vente)', `<div class="barres">${parEtape.map(x => `<div class="barre-ligne"><span>${x.et} · ${NOMS_ETAPES[x.et].split(' ')[0]}</span><span class="piste"><span style="width:${x.v / maxi * 100}%"></span></span><span class="v">${fmtK(x.v)}</span></div>`).join('')}</div>`)}
+    </div>
+    ${carte('Opportunités ouvertes par offre', `<div class="barres">${Object.entries(offres).sort((a, b) => b[1] - a[1]).map(([o, n]) => `<div class="barre-ligne"><span>${esc(o)}</span><span class="piste"><span style="width:${n / maxO * 100}%"></span></span><span class="v">${n}</span></div>`).join('') || vide('Aucune opportunité.')}</div>`)}`;
+  }
+
+  /* ---------- Clients ---------- */
+  function clientsFiltres() {
+    const f = ui.filtresClients, q = norm(f.q);
+    return E().clients.filter(c => (!f.statut || c.statut === f.statut) && (!f.agence || c.agence === f.agence) &&
+      (!q || norm(c.nom + ' ' + c.site + ' ' + c.secteur).includes(q)));
+  }
+  function carteGeo(liste) {
+    const W = 400, H = 520, lon0 = 7.0, lon1 = 7.75, lat0 = 47.5, lat1 = 48.2;
+    const X = lon => 20 + (lon - lon0) / (lon1 - lon0) * (W - 40);
+    const Y = lat => 20 + (lat1 - lat) / (lat1 - lat0) * (H - 40);
+    let grille = '';
+    for (let lo = 7.1; lo < lon1 - 0.01; lo += 0.1) grille += `<line x1="${X(lo)}" x2="${X(lo)}" y1="20" y2="${H - 20}" stroke="#E8EEF6"/>`;
+    for (let la = 47.6; la < lat1 - 0.01; la += 0.1) grille += `<line x1="20" x2="${W - 20}" y1="${Y(la)}" y2="${Y(la)}" stroke="#E8EEF6"/>`;
+    const places = liste.filter(c => typeof c.lat === 'number' && typeof c.lon === 'number' && c.lon >= lon0 && c.lon <= lon1 && c.lat >= lat0 && c.lat <= lat1);
+    const points = places.map(c => {
+      const ouvertes = E().opportunites.filter(o => o.clientId === c.id && (o.statut === 'Nouvelle' || o.statut === 'Validée')).length;
+      const r = 7 + Math.min(4, ouvertes) * 1.6, x = X(c.lon), y = Y(c.lat);
+      const droite = x > W - 120;
+      return `<g class="point" data-act="ouvrirClient" data-id="${c.id}" role="button" tabindex="0" aria-label="${esc(c.nom)}, ${esc(c.site)}">
+        <title>${esc(c.nom)} · ${ouvertes} opportunité(s) ouverte(s)</title>
+        <circle cx="${x}" cy="${y}" r="${r}" fill="${c.statut === 'Client' ? '#1F5FBF' : '#FFFFFF'}" stroke="#1F5FBF" stroke-width="2"/>
+        <text x="${droite ? x - r - 5 : x + r + 5}" y="${y + 4}" text-anchor="${droite ? 'end' : 'start'}" font-size="12" fill="#1B2A41">${esc(c.site)}</text></g>`;
+    }).join('');
+    const horsCarte = liste.length - places.length;
+    return `<div class="carte-geo"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Carte des clients et prospects du Haut-Rhin">
+      <rect x="20" y="20" width="${W - 40}" height="${H - 40}" fill="#FAFCFF" stroke="#D5DEEA"/>${grille}${points}</svg>
+      <div class="legende"><span><i style="background:#1F5FBF"></i>Client</span><span><i style="border:2px solid #1F5FBF;background:#fff"></i>Prospect</span><span>Point plus gros : plus d'opportunités ouvertes</span>
+      ${horsCarte ? `<span>${horsCarte} site(s) sans coordonnées GPS</span>` : ''}</div></div>`;
+  }
+  function vueClients() {
+    if (ui.clientId) return ficheClient();
+    const e = E(), f = ui.filtresClients, liste = clientsFiltres();
+    const agences = [...new Set(e.clients.map(c => c.agence).filter(Boolean))];
+    const lignes = liste.map(c => {
+      const ouvertes = e.opportunites.filter(o => o.clientId === c.id && (o.statut === 'Nouvelle' || o.statut === 'Validée')).length;
+      const aff = e.affaires.filter(a => a.clientId === c.id).length;
+      return `<tr class="cliquable" data-act="ouvrirClient" data-id="${c.id}"><td><strong>${esc(c.nom)}</strong><span class="sous-ligne">${esc(c.site)} · ${esc(c.secteur)}</span></td>
+        <td>${badgeClient(c.statut)}</td><td>${esc(c.agence)}</td><td class="montant">${ouvertes}</td><td class="montant">${aff}</td></tr>`;
+    }).join('');
+    return `<div class="page-head"><div><h1>Clients et prospects</h1><p class="sous">Cartographie de la DR Sud Alsace. Cliquez un site pour ouvrir sa fiche.</p></div>
+      <div class="actions"><button class="btn" data-act="vue" data-vue="parametres">Importer la base Excel</button></div></div>
+      <div class="filtres">
+        <label class="champ recherche" for="f-q"><span>Rechercher</span><input type="search" id="f-q" value="${esc(f.q)}" placeholder="Nom, ville, secteur" data-input="filtreClient" data-champ="q"></label>
+        <label class="champ" for="f-statut"><span>Statut</span><select id="f-statut" data-change="filtreClient" data-champ="statut"><option value="">Tous</option><option ${f.statut === 'Client' ? 'selected' : ''}>Client</option><option ${f.statut === 'Prospect' ? 'selected' : ''}>Prospect</option></select></label>
+        <label class="champ" for="f-agence"><span>Agence</span><select id="f-agence" data-change="filtreClient" data-champ="agence"><option value="">Toutes</option>${agences.map(a => `<option ${f.agence === a ? 'selected' : ''}>${esc(a)}</option>`).join('')}</select></label>
+      </div>
+      <div class="grille-2" id="zone-clients">
+        <section class="carte">${carteGeo(liste)}</section>
+        <div class="table-wrap" style="align-self:start"><table><thead><tr><th>Client</th><th>Statut</th><th>Agence</th><th class="montant">Opp. ouvertes</th><th class="montant">Affaires</th></tr></thead>
+        <tbody>${lignes || `<tr><td colspan="5" class="vide">Aucun client ne correspond.</td></tr>`}</tbody></table></div>
+      </div>`;
+  }
+  function ficheClient() {
+    const e = E(), c = client(ui.clientId);
+    const contacts = e.contacts.filter(x => x.clientId === c.id);
+    const inst = e.installations.filter(x => x.clientId === c.id);
+    const pds = e.prediagnostics.filter(x => x.clientId === c.id);
+    const opps = e.opportunites.filter(x => x.clientId === c.id);
+    const affs = e.affaires.filter(x => x.clientId === c.id);
+    const onglets = [['infos', 'Informations'], ['contacts', `Contacts (${contacts.length})`], ['installations', `Installations (${inst.length})`],
+      ['prediags', `Pré-diagnostics (${pds.length})`], ['opps', `Opportunités (${opps.length})`], ['affaires', `Affaires (${affs.length})`]];
+    let corps = '';
+    switch (ui.ongletClient) {
+      case 'contacts':
+        corps = contacts.length ? `<div class="table-wrap"><table><thead><tr><th>Nom</th><th>Fonction</th><th>Email</th><th>Téléphone</th><th>Référent énergie</th></tr></thead><tbody>${contacts.map(x => `<tr><td>${esc(x.nom)}</td><td>${esc(x.fonction)}</td><td>${esc(x.email || '—')}</td><td>${esc(x.telephone || '—')}</td><td>${x.referentEnergie ? 'Oui' : 'Non'}</td></tr>`).join('')}</tbody></table></div>` : vide('Aucun contact.');
+        break;
+      case 'installations':
+        corps = `${inst.length ? `<div class="table-wrap"><table><thead><tr><th>Type</th><th>Puissance</th><th>Année</th><th>Marque</th><th>Note</th></tr></thead><tbody>${inst.map(x => `<tr><td><strong>${esc(x.type)}</strong></td><td class="num">${x.puissance === null || x.puissance === undefined ? '—' : esc(fmtNombre(x.puissance) + ' ' + x.unite)}</td><td>${esc(x.annee || '—')}</td><td>${esc(x.marque || '—')}</td><td>${esc(x.note || '')}</td></tr>`).join('')}</tbody></table></div>` : vide('Aucune installation connue.')}
+          <section class="carte" style="margin-top:14px"><h3 style="margin-bottom:10px">Ajouter au parc installé</h3>
+          <p class="muted small" style="margin-bottom:10px">Ajoutez des batteries à un client équipé en PV : la règle R11 crée une opportunité de vente complémentaire.</p>
+          <div class="form-grille">
+            <label class="champ" for="ins-type"><span>Type</span><select id="ins-type">${['PV', 'Batteries', 'IRVE', 'GTB', 'EMS', 'CVC', 'Autre'].map(t => `<option>${t}</option>`).join('')}</select></label>
+            <label class="champ" for="ins-p"><span>Puissance ou quantité</span><input type="number" id="ins-p" min="0"></label>
+            <label class="champ" for="ins-u"><span>Unité</span><input type="text" id="ins-u" placeholder="kWc, kWh, bornes…"></label>
+            <label class="champ" for="ins-a"><span>Année</span><input type="number" id="ins-a" min="1990" max="2100"></label>
+            <label class="champ" for="ins-m"><span>Marque</span><input type="text" id="ins-m"></label>
+          </div><div class="actions" style="margin-top:12px"><button class="btn" data-act="ajouterInstallation">Ajouter l'installation</button></div></section>`;
+        break;
+      case 'prediags':
+        corps = pds.length ? `<div class="table-wrap"><table><thead><tr><th>Référence</th><th>Date</th><th>Auditeur</th><th class="montant">Opportunités</th></tr></thead><tbody>${pds.map(p => `<tr><td>${esc(p.ref)}</td><td>${fmtDate(p.date)}</td><td>${esc(p.auditeur)}</td><td class="montant">${e.opportunites.filter(o => o.prediagId === p.id).length}</td></tr>`).join('')}</tbody></table></div>` : vide('Aucun pré-diagnostic pour ce client.');
+        break;
+      case 'opps':
+        corps = tableOpps(opps);
+        break;
+      case 'affaires':
+        corps = affs.length ? `<div class="table-wrap"><table><thead><tr><th>Affaire</th><th>Offre</th><th>Étape</th><th class="montant">Prix de vente</th><th class="montant">Reste à charge</th></tr></thead><tbody>${affs.map(a => `<tr class="cliquable" data-act="ouvrirAffaire" data-id="${a.id}"><td><strong>${esc(a.titre)}</strong><span class="sous-ligne">${a.id}</span></td><td>${badgeOffre(a.offre)}</td><td>${lettre(a.etape, a.etape)}</td><td class="montant">${fmtEuros(a.resultat.pv)}</td><td class="montant">${fmtEuros(a.resultat.rac)}</td></tr>`).join('')}</tbody></table></div>` : vide('Aucune affaire.');
+        break;
+      default:
+        corps = `<dl class="form-grille">${[['Raison sociale', c.nom], ['Site', c.site], ['Adresse', c.adresse], ['Secteur', c.secteur], ['Statut', c.statut], ['Agence', c.agence],
+          ['Coordonnées GPS', typeof c.lat === 'number' ? `${c.lat}, ${c.lon}` : '—'], ['Identifiant', c.id]].map(([k, v]) => `<div class="champ"><span>${k}</span><div>${esc(v || '—')}</div></div>`).join('')}</dl>`;
+    }
+    return `<div class="page-head"><div><button class="retour" data-act="retourClients">← Tous les clients</button>
+      <h1>${esc(c.nom)}</h1><p class="sous">${esc(c.site)} · ${esc(c.secteur)} · agence ${esc(c.agence)} &nbsp;${badgeClient(c.statut)}</p></div>
+      <div class="actions"><button class="btn" data-act="nouveauPrediag" data-id="${c.id}">Nouveau pré-diagnostic</button></div></div>
+      <div class="onglets" role="tablist">${onglets.map(([id, lib]) => `<button role="tab" data-act="ongletClient" data-onglet="${id}" aria-selected="${ui.ongletClient === id}">${lib}</button>`).join('')}</div>
+      <section class="carte">${corps}</section>`;
+  }
+
+  /* ---------- Pré-diagnostics ---------- */
+  function brouillonPrediag(clientId) {
+    return { clientId: clientId || E().clients[0].id, ref: '', date: contexteLocal().aujourdhui, auditeur: '', energyExpert: '', valeurs: {} };
+  }
+  function apercuRegles() {
+    const p = ui.prediag, e = E();
+    const regles = Moteur.evaluer(e.regles, p.valeurs, parcClient(e, p.clientId), contexteLocal().aujourdhui, 'prediag');
+    if (!regles.length) return `<div class="apercu" style="background:var(--fond)">Aucune règle ne se déclenche pour l'instant. Renseignez les consommations, la puissance CVC, les surfaces…</div>`;
+    return `<div class="apercu"><strong>${regles.length} règle(s) se déclencheront à l'enregistrement :</strong><ul>${regles.map(r => {
+      const deja = e.opportunites.some(o => o.clientId === p.clientId && o.regleId === r.id && o.statut !== 'Écartée');
+      return `<li>${r.id} · ${esc(r.titre)} ${badgeOffre(r.offre)}${deja ? ' <span class="muted small">(déjà ouverte : pas de doublon)</span>' : ''}</li>`;
+    }).join('')}</ul></div>`;
+  }
+  function champQuestion(q) {
+    const v = ui.prediag.valeurs[q.id] ?? '';
+    const id = 'q-' + q.id;
+    const lib = `<span>${esc(q.label)}${q.unite ? ` <span class="unite">(${esc(q.unite)})</span>` : ''}</span>`;
+    if (q.type === 'ouinon') return `<label class="champ" for="${id}">${lib}<select id="${id}" data-change="question" data-q="${q.id}"><option value="">—</option><option value="oui" ${v === 'oui' ? 'selected' : ''}>Oui</option><option value="non" ${v === 'non' ? 'selected' : ''}>Non</option></select></label>`;
+    if (q.type === 'texte-long') return `<label class="champ large" for="${id}">${lib}<textarea id="${id}" data-input="question" data-q="${q.id}">${esc(v)}</textarea></label>`;
+    const type = q.type === 'nombre' ? 'number" step="any" min="0' : (q.type === 'date' ? 'date' : 'text');
+    return `<label class="champ" for="${id}">${lib}<input type="${type}" id="${id}" value="${esc(v)}" data-input="question" data-q="${q.id}"></label>`;
+  }
+  function vuePrediags() {
+    const e = E();
+    if (!ui.prediag) ui.prediag = brouillonPrediag();
+    const p = ui.prediag;
+    const groupes = [...new Set(SEED.questions.map(q => q.groupe))];
+    const resultat = ui.dernierPrediag ? (() => {
+      const r = ui.dernierPrediag;
+      const opps = e.opportunites.filter(o => r.crees.includes(o.id));
+      return `<section class="carte"><div class="alerte ok" style="margin-top:0"><strong>Power Automate · Règles d'opportunités :</strong> ${opps.length} opportunité(s) créée(s) pour ${esc(client(r.clientId).nom)}. L'Energy Expert est prévenu pour validation.</div>
+        <div style="margin-top:12px">${tableOpps(opps, { vide: 'Toutes les opportunités détectées existaient déjà pour ce client.' })}</div></section>`;
+    })() : '';
+    const liste = e.prediagnostics.slice().reverse();
+    return `<div class="page-head"><div><h1>Pré-diagnostics</h1><p class="sous">Le pré-diagnostic est la porte d'entrée : ses réponses déclenchent les règles qui créent les opportunités.</p></div>
+      <div class="actions"><button class="btn" data-act="chargerExemple">Charger l'exemple Endress Hauser (réf. 000278)</button></div></div>
+      ${resultat}
+      <div class="grille-fiche">
+        <section class="carte"><div class="carte-head"><h2>Nouveau pré-diagnostic</h2><button class="btn petit discret" data-act="viderPrediag">Vider le formulaire</button></div>
+          <div class="form-grille">
+            <label class="champ" for="pd-client"><span>Client</span><select id="pd-client" data-change="pd" data-champ="clientId">${e.clients.map(c => `<option value="${c.id}" ${c.id === p.clientId ? 'selected' : ''}>${esc(c.nom)} · ${esc(c.site)}</option>`).join('')}</select></label>
+            <label class="champ" for="pd-ref"><span>Référence</span><input type="text" id="pd-ref" value="${esc(p.ref)}" placeholder="PE-000000" data-input="pd" data-champ="ref"></label>
+            <label class="champ" for="pd-date"><span>Date de la visite</span><input type="date" id="pd-date" value="${esc(p.date)}" data-input="pd" data-champ="date"></label>
+            <label class="champ" for="pd-aud"><span>Auditeur</span><input type="text" id="pd-aud" value="${esc(p.auditeur)}" data-input="pd" data-champ="auditeur"></label>
+            <label class="champ" for="pd-ee"><span>Energy Expert</span><input type="text" id="pd-ee" value="${esc(p.energyExpert)}" data-input="pd" data-champ="energyExpert"></label>
+          </div>
+          ${groupes.map(g => `<fieldset style="margin-top:18px"><legend>${esc(g)}</legend><div class="form-grille">${SEED.questions.filter(q => q.groupe === g).map(champQuestion).join('')}</div></fieldset>`).join('')}
+          <p class="muted small" style="margin-top:14px">Le questionnaire réel compte 18 questions : il sera repris de l'outil de pré-diagnostic actuel.</p>
+          <div class="actions" style="margin-top:14px"><button class="btn principal" data-act="enregistrerPrediag">Enregistrer et analyser</button></div>
+        </section>
+        <div class="colonne collant">
+          <section class="carte"><h2 style="margin-bottom:10px">Aperçu du moteur de règles</h2><div id="apercu">${apercuRegles()}</div>
+            <p class="muted small" style="margin-top:10px">Les seuils se règlent dans Paramètres → Règles.</p></section>
+          <section class="carte"><h2 style="margin-bottom:10px">Historique</h2>${liste.length ? `<ul class="liste-simple">${liste.map(x => `<li><span><strong>${esc(client(x.clientId).nom)}</strong><span class="sous-ligne muted">${esc(x.ref)} · ${fmtDate(x.date)}</span></span><span class="badge bleu">${e.opportunites.filter(o => o.prediagId === x.id).length} opp.</span></li>`).join('')}</ul>` : vide('Aucun pré-diagnostic.')}</section>
+        </div>
+      </div>`;
+  }
+
+  /* ---------- Opportunités ---------- */
+  function vueOpportunites() {
+    const e = E(), f = ui.filtresOpp;
+    const offres = [...new Set(e.opportunites.map(o => o.offre))];
+    const liste = e.opportunites.filter(o => (!f.statut || o.statut === f.statut) && (!f.offre || o.offre === f.offre)).slice().reverse();
+    return `<div class="page-head"><div><h1>Opportunités</h1><p class="sous">Créées par les règles à partir des pré-diagnostics et du parc installé. L'Energy Expert valide, le responsable d'affaires chiffre.</p></div></div>
+      <div class="filtres">
+        <label class="champ" for="fo-s"><span>Statut</span><select id="fo-s" data-change="filtreOpp" data-champ="statut"><option value="">Tous</option>${['Nouvelle', 'Validée', 'En affaire', 'Écartée'].map(s => `<option value="${s}" ${f.statut === s ? 'selected' : ''}>${s === 'Nouvelle' ? 'À valider' : s}</option>`).join('')}</select></label>
+        <label class="champ" for="fo-o"><span>Offre</span><select id="fo-o" data-change="filtreOpp" data-champ="offre"><option value="">Toutes</option>${offres.map(o => `<option ${f.offre === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></label>
+      </div>
+      ${tableOpps(liste, { vide: 'Aucune opportunité ne correspond aux filtres.' })}`;
+  }
+
+  /* ---------- Affaires ---------- */
+  function carteAffaire(a) {
+    const c = client(a.clientId);
+    return `<button type="button" class="carte-aff" data-act="ouvrirAffaire" data-id="${a.id}">
+      <span class="t">${esc(a.titre)}</span><span class="c">${esc(c.nom)} · ${a.id}</span>
+      <span class="m"><span>${badgeOffre(a.offre)}</span><span>${fmtK(a.resultat.pv)}</span></span>
+      ${a.etape === 'C' ? `<span class="barre-av" aria-label="Avancement ${a.avancement} %"><span style="width:${a.avancement}%"></span></span>` : ''}
+      ${a.resultat.alertes.length ? `<span class="badge rouge">À contrôler</span>` : ''}</button>`;
+  }
+  function vueAffaires() {
+    if (ui.affaireId) return ficheAffaire();
+    return `<div class="page-head"><div><h1>Affaires</h1><p class="sous">Chaque affaire avance dans le parcours UPTIMUM, de A à D. Les interlocuteurs sont prévenus à chaque étape.</p></div></div>
+      ${resumeEtapes()}`;
+  }
+  function stepper(a) {
+    return `<div class="stepper">${ETAPES.map(et => {
+      const i = ETAPES.indexOf(et), j = ETAPES.indexOf(a.etape);
+      return `<div class="pas ${i < j ? 'fait' : i === j ? 'courant' : ''}">${lettre(et, a.etape)}<span class="n">${NOMS_ETAPES[et]}</span></div>`;
+    }).join('')}</div>`;
+  }
+  function categories() { return [...new Set(E().produits.map(p => p.categorie))]; }
+  function ficheAffaire() {
+    const e = E(), a = e.affaires.find(x => x.id === ui.affaireId);
+    if (!a) { ui.affaireId = null; return vueAffaires(); }
+    if (ui.brouillonPour !== a.id) { ui.brouillon = clone(a.chiffrage); ui.brouillonPour = a.id; ui.modifie = false; }
+    const b = ui.brouillon, c = client(a.clientId);
+    const i = ETAPES.indexOf(a.etape);
+    const cats = categories();
+    const lignes = b.lignes.map((l, k) => {
+      const p = produit(l.produitId) || e.produits[0];
+      const marques = e.produits.filter(x => x.categorie === p.categorie);
+      return `<tr>
+        <td><select aria-label="Catégorie" data-change="ligne" data-i="${k}" data-champ="categorie">${cats.map(ct => `<option ${ct === p.categorie ? 'selected' : ''}>${esc(ct)}</option>`).join('')}</select></td>
+        <td><select aria-label="Marque" data-change="ligne" data-i="${k}" data-champ="marque">${marques.map(m => `<option value="${m.id}" ${m.id === p.id ? 'selected' : ''}>${esc(m.marque)}</option>`).join('')}</select><span class="sous-ligne">${esc(p.reference)} · ${esc(p.designation)}</span></td>
+        <td><input type="number" min="0" step="1" aria-label="Quantité" value="${esc(l.qte)}" data-input="ligne" data-i="${k}" data-champ="qte"></td>
+        <td class="montant">${fmtEuros(p.prixAchat)}</td><td class="montant" id="lt-${k}">${fmtEuros(p.prixAchat * (num(l.qte) || 0))}</td>
+        <td><button class="btn petit discret" aria-label="Supprimer la ligne" data-act="supprLigne" data-i="${k}">✕</button></td></tr>`;
+    }).join('');
+    const aides = e.aides.map(ad => {
+      const s = b.aides.find(x => x.aideId === ad.id);
+      const champ = ad.type === 'cee' ? 'qte' : 'montant';
+      return `<div class="aide-ligne">
+        <input type="checkbox" id="ai-${ad.id}" ${s ? 'checked' : ''} data-change="aide" data-aide="${ad.id}">
+        <label for="ai-${ad.id}"><span class="nom">${esc(ad.nom)}</span><br><span class="note">${esc(ad.note)}</span></label>
+        <span class="montant" id="am-${ad.id}">${s ? fmtEuros(Moteur.montantAide(ad, s, e.parametres.prixMWhCumac).montant) : '—'}</span>
+        ${s ? `<span class="saisie"><label for="ais-${ad.id}">${ad.type === 'cee' ? `Quantité (${esc(ad.uniteQte)})` : 'Montant (€)'}</label>
+          <input type="number" min="0" step="any" id="ais-${ad.id}" value="${esc(s[champ] ?? '')}" data-input="aide" data-aide="${ad.id}" data-champ="${champ}">
+          ${ad.type === 'cee' ? `<span id="ak-${ad.id}">${Math.round(Moteur.montantAide(ad, s, e.parametres.prixMWhCumac).kwhc).toLocaleString('fr-FR')} kWh cumac</span>` : ''}</span>` : ''}
+      </div>`;
+    }).join('');
+    return `<div class="page-head"><div><button class="retour" data-act="retourAffaires">← Toutes les affaires</button>
+      <h1>${esc(a.titre)}</h1><p class="sous">${esc(c.nom)} · ${esc(c.site)} · ${a.id} &nbsp;${badgeOffre(a.offre)}</p></div>
+      <div class="actions">
+        ${i > 0 ? `<button class="btn discret" data-act="etape" data-id="${a.id}" data-etape="${ETAPES[i - 1]}">← Étape ${ETAPES[i - 1]}</button>` : ''}
+        ${i < 3 ? `<button class="btn" data-act="etape" data-id="${a.id}" data-etape="${ETAPES[i + 1]}">Passer à l'étape ${ETAPES[i + 1]} →</button>` : ''}
+      </div></div>
+      ${stepper(a)}
+      <div class="grille-fiche">
+        <div class="colonne">
+          <section class="carte"><div class="carte-head"><h2>Calculette : matériel</h2><button class="btn petit" data-act="ajouterLigne">Ajouter une ligne</button></div>
+            <p class="muted small" style="margin-bottom:10px">Changer la marque remplace le produit par son équivalent dans la même catégorie. Prix d'achat de démonstration.</p>
+            ${b.lignes.length ? `<div class="table-wrap lignes-mat"><table><thead><tr><th>Catégorie</th><th>Marque et produit</th><th>Qté</th><th class="montant">Prix unitaire</th><th class="montant">Total</th><th></th></tr></thead><tbody>${lignes}</tbody></table></div>` : vide('Aucune ligne de matériel.')}
+            <div class="reglage-marge" style="margin-top:14px">
+              <label class="champ" for="ch-mo" style="width:170px"><span>Main d'œuvre (€)</span><input type="number" min="0" step="100" id="ch-mo" value="${esc(b.mainOeuvre)}" data-input="chiffrage" data-champ="mainOeuvre"></label>
+              <label class="champ" for="ch-m"><span>Marge (%)</span><input type="number" min="0" step="0.5" id="ch-m" value="${esc(b.marge)}" data-input="chiffrage" data-champ="marge"></label>
+              <div class="champ"><span>La marge s'applique</span><div class="segment" role="group" aria-label="Base de la marge">
+                <button type="button" data-act="base" data-base="avant" aria-pressed="${b.base !== 'apres'}">Avant aides</button>
+                <button type="button" data-act="base" data-base="apres" aria-pressed="${b.base === 'apres'}">Après aides</button></div></div>
+            </div>
+          </section>
+          <section class="carte"><div class="carte-head"><h2>Aides et primes CEE</h2><span class="muted small">Prix du MWh cumac : ${fmtNombre(e.parametres.prixMWhCumac)} €</span></div>${aides}</section>
+          ${a.etape === 'C' || a.etape === 'D' ? carte('Chantier', blocChantier(a, false)) : ''}
+        </div>
+        <div class="colonne collant">
+          <section class="carte resultat" id="resultat">${panneauResultat(a)}</section>
+          ${carte('Interlocuteurs de l\'étape ' + a.etape, a.interlocuteurs.length ? `<ul class="liste-simple">${a.interlocuteurs.map(x => `<li><span>${esc(x.service)}</span><span class="muted small">${esc(x.nom)}</span></li>`).join('')}</ul>` : vide('Aucun service à cette étape.'))}
+          ${carte('Historique', `<ul class="liste-simple">${a.historique.slice().reverse().map(h => `<li><span>${esc(h.texte)}</span><span class="muted small num">${fmtDate(h.date)}</span></li>`).join('')}</ul>`)}
+        </div>
+      </div>`;
+  }
+  function panneauResultat(a) {
+    const e = E();
+    const r = Moteur.calculer(ui.brouillon, e.produits, e.aides, e.parametres);
+    const m = num(ui.brouillon.marge);
+    return `<div class="rac-lib">Reste à charge client</div><div class="rac">${fmtEuros(r.rac)}</div>
+      <dl>
+        <dt>Matériel</dt><dd>${fmtEuros(r.materiel)}</dd>
+        <dt>Main d'œuvre</dt><dd>${fmtEuros(r.mainOeuvre)}</dd>
+        <dt class="fort">Coût de revient</dt><dd class="fort">${fmtEuros(r.cout)}</dd>
+        <dt>Marge Eiffage (${fmtNombre(m === null ? e.parametres.margeDefaut : m)} %, ${ui.brouillon.base === 'apres' ? 'après' : 'avant'} aides)</dt><dd>${fmtEuros(r.marge)}</dd>
+        <dt class="fort">Prix de vente HT</dt><dd class="fort">${fmtEuros(r.pv)}</dd>
+        <dt>Aides déduites</dt><dd>− ${fmtEuros(r.totalAides)}</dd>
+      </dl>
+      ${r.alertes.map(x => `<div class="alerte ${x.niveau}">${esc(x.message)}</div>`).join('')}
+      <div class="formule">${ui.brouillon.base === 'apres' ? 'RAC = max(0 ; C − Σ aides) × (1 + m)' : 'PV = C × (1 + m) · RAC = max(0 ; PV − Σ aides)'}</div>
+      <div class="actions" style="margin-top:14px"><button class="btn principal" data-act="enregistrerChiffrage" data-id="${a.id}">Enregistrer dans l'affaire</button>
+        ${ui.modifie ? '<span class="non-enregistre">Modifications non enregistrées</span>' : ''}</div>`;
+  }
+  function majCalculette() {
+    const e = E(), a = e.affaires.find(x => x.id === ui.affaireId);
+    if (!a) return;
+    ui.modifie = true;
+    $('#resultat').innerHTML = panneauResultat(a);
+    ui.brouillon.lignes.forEach((l, k) => {
+      const p = produit(l.produitId), cell = $('#lt-' + k);
+      if (p && cell) cell.textContent = fmtEuros(p.prixAchat * (num(l.qte) || 0));
+    });
+    ui.brouillon.aides.forEach(s => {
+      const ad = e.aides.find(x => x.id === s.aideId);
+      if (!ad) return;
+      const r = Moteur.montantAide(ad, s, e.parametres.prixMWhCumac);
+      const m = $('#am-' + ad.id), k = $('#ak-' + ad.id);
+      if (m) m.textContent = fmtEuros(r.montant);
+      if (k) k.textContent = Math.round(r.kwhc).toLocaleString('fr-FR') + ' kWh cumac';
+    });
+  }
+
+  /* ---------- Annuaire ---------- */
+  function vueAnnuaire() {
+    const e = E();
+    return `<div class="page-head"><div><h1>Annuaire interne</h1><p class="sous">Qui intervient à quelle étape. Quand une affaire change d'étape, ces services sont ajoutés et prévenus automatiquement.</p></div></div>
+      <div class="table-wrap"><table><thead><tr><th>Service</th><th>Rôle dans l'affaire</th><th>Étapes</th><th>Offres concernées</th><th>Référent</th></tr></thead><tbody>
+      ${e.annuaire.map(s => `<tr><td><strong>${esc(s.service)}</strong></td><td>${esc(s.role)}</td>
+        <td><div class="actions">${s.etapes.length ? s.etapes.map(et => `<span class="etape-lettre">${et}</span>`).join('') : '<span class="muted small">Tableau de bord</span>'}</div></td>
+        <td>${s.offres.length ? s.offres.map(badgeOffre).join(' ') : '<span class="muted small">Toutes</span>'}</td>
+        <td><span class="badge orange">${esc(s.nom)}</span></td></tr>`).join('')}
+      </tbody></table></div>
+      <p class="muted small">Les noms des référents sont à compléter avec la direction de la DR (volet 6 du cahier des charges).</p>`;
+  }
+
+  /* ---------- Paramètres ---------- */
+  function vueParametres() {
+    const e = E(), pa = e.parametres;
+    const peut3E = ui.role === 'Cellule 3E';
+    const peutRegles = ui.role === 'Cellule 3E' || ui.role === 'Energy Expert';
+    const regles = e.regles.map(r => {
+      const cNum = r.conditions.find(c => typeof c.valeur === 'number');
+      return `<tr><td><strong>${r.id}</strong></td><td>${esc(r.titre)}<span class="sous-ligne">${r.conditions.map(texteCondition).map(esc).join(' et ')}</span></td>
+        <td>${badgeOffre(r.offre)}</td><td>${badgePrio(r.priorite)}</td>
+        <td>${cNum ? `<input type="number" step="any" style="width:90px" aria-label="Seuil de ${r.id}" value="${cNum.valeur}" ${peutRegles ? '' : 'disabled'} data-change="seuilRegle" data-id="${r.id}">` : '<span class="muted small">—</span>'}</td>
+        <td><input type="checkbox" aria-label="Activer ${r.id}" ${r.actif ? 'checked' : ''} ${peutRegles ? '' : 'disabled'} data-change="actifRegle" data-id="${r.id}"></td></tr>`;
+    }).join('');
+    const exports = Stockage.mode === 'python'
+      ? `<div class="actions">${['clients', 'opportunites', 'affaires', 'prediagnostics', 'journal'].map(t => `<a class="btn petit" href="/api/export/${t}.csv">${t}.csv</a>`).join('')}</div>`
+      : `<p class="muted small">Disponible en lançant la démo avec Python (backend/server.py).</p>`;
+    return `<div class="page-head"><div><h1>Paramètres</h1><p class="sous">Réglages communs, règles d'opportunités, aides, catalogue et import de la base clients.</p></div></div>
+      <div class="grille-2">
+        ${carte('Réglages de la calculette', `<div class="form-grille">
+          <label class="champ" for="p-marge"><span>Marge par défaut (%)</span><input type="number" min="0" step="0.5" id="p-marge" value="${pa.margeDefaut}" ${peut3E ? '' : 'disabled'}></label>
+          <label class="champ" for="p-cumac"><span>Prix du MWh cumac (€)</span><input type="number" min="0" step="0.1" id="p-cumac" value="${pa.prixMWhCumac}" ${peut3E ? '' : 'disabled'}></label></div>
+          <p class="muted small" style="margin:10px 0">${peut3E ? 'Les chiffrages déjà enregistrés gardent leurs valeurs.' : 'Modifiable avec le profil « Cellule 3E ».'} Valeur de démonstration.</p>
+          <button class="btn" data-act="majParametres" ${peut3E ? '' : 'disabled'}>Enregistrer les réglages</button>`)}
+        ${carte('Importer la base clients (Excel)', `<p class="muted small" style="margin-bottom:10px">Dans Excel : Fichier → Enregistrer sous → CSV. Colonnes reconnues : nom, site, adresse, lat, lon, secteur, statut, agence.</p>
+          <label class="champ" for="csv-fichier"><span>Fichier CSV</span><input type="file" id="csv-fichier" accept=".csv,text/csv" data-change="fichierCSV"></label>
+          <label class="champ" for="csv-texte" style="margin-top:10px"><span>ou collez le contenu</span><textarea id="csv-texte" placeholder="nom;site;lat;lon;statut;agence&#10;Mon client;Mulhouse;47,75;7,34;Prospect;Mulhouse"></textarea></label>
+          <div class="actions" style="margin-top:10px"><button class="btn" data-act="importer">Importer</button></div>
+          <h3 style="margin:16px 0 8px">Exporter (Python)</h3>${exports}`)}
+      </div>
+      ${carte("Règles d'opportunités", `<p class="muted small" style="margin-bottom:10px">${peutRegles ? 'Modifiez un seuil ou désactivez une règle : le prochain pré-diagnostic en tiendra compte.' : 'Modifiables avec les profils « Energy Expert » ou « Cellule 3E ».'}</p>
+        <div class="table-wrap"><table><thead><tr><th>Règle</th><th>Opportunité et conditions</th><th>Offre</th><th>Priorité</th><th>Seuil</th><th>Active</th></tr></thead><tbody>${regles}</tbody></table></div>`)}
+      <div class="grille-2">
+        ${carte('Aides', `<div class="table-wrap"><table><thead><tr><th>Aide</th><th>Calcul</th></tr></thead><tbody>${e.aides.map(a => `<tr><td><strong>${esc(a.nom)}</strong><span class="sous-ligne">${esc(a.note)}</span></td><td class="num">${a.type === 'cee' ? `${a.coefKwhc.toLocaleString('fr-FR')} kWh cumac × quantité (${esc(a.uniteQte)})` : 'Montant saisi'}</td></tr>`).join('')}</tbody></table></div>`)}
+        ${carte('Catalogue matériel', `<div class="table-wrap"><table><thead><tr><th>Catégorie</th><th>Marque</th><th>Référence</th><th class="montant">Prix d'achat</th></tr></thead><tbody>${e.produits.map(p => `<tr><td>${esc(p.categorie)}</td><td>${esc(p.marque)}</td><td>${esc(p.reference)}<span class="sous-ligne">${esc(p.protocole)}</span></td><td class="montant">${fmtEuros(p.prixAchat)}</td></tr>`).join('')}</tbody></table></div>`)}
+      </div>
+      ${carte('Données de démonstration', `<p class="muted" style="margin-bottom:10px">Remet tous les clients, opportunités et affaires dans leur état de départ${Stockage.mode === 'python' ? ' (base SQLite comprise)' : ' (dans ce navigateur)'}.</p>
+        <div class="actions">${ui.confirmerReset ? `<button class="btn danger" data-act="reinit">Confirmer la réinitialisation</button><button class="btn discret" data-act="annulerReinit">Annuler</button>` : `<button class="btn danger" data-act="demanderReinit">Réinitialiser la démo</button>`}</div>`)}`;
+  }
+
+  /* ---------- Automatisations ---------- */
+  function vueAutomatisations() {
+    const e = E();
+    const flux = [
+      ["Règles d'opportunités", 'Pré-diagnostic enregistré', 'Compare les réponses aux seuils, crée les opportunités'],
+      ['Ventes complémentaires', 'PV ou batteries ajoutés au parc', 'Crée une opportunité EMS / Smart Grid'],
+      ['Affectation et notifications', "Affaire créée ou changement d'étape", "Ajoute et prévient les services de l'étape"],
+      ['Notifications', 'Opportunité validée, réserve de chantier', 'Prévient le responsable concerné'],
+      ['Alerte reste à charge nul', 'Chiffrage enregistré à 0 €', 'Prévient la cellule 3E pour validation'],
+      ['Archivage', 'Document Quick Devis déposé', "Lie le document à l'affaire (non simulé dans la démo)"]
+    ];
+    const niveaux = { auto: 'vert', alerte: 'rouge', info: '' };
+    const j = e.journal.slice().reverse();
+    return `<div class="page-head"><div><h1>Automatisations</h1><p class="sous">Ce que fera Power Automate. Dans la démo, ${Stockage.mode === 'python' ? 'le serveur Python' : 'le navigateur'} simule ces flux et les inscrit au journal.</p></div></div>
+      ${carte('Flux prévus (volet 10)', `<div class="table-wrap"><table><thead><tr><th>Flux</th><th>Déclencheur</th><th>Action</th></tr></thead><tbody>${flux.map(f => `<tr><td><strong>${esc(f[0])}</strong></td><td>${esc(f[1])}</td><td>${esc(f[2])}</td></tr>`).join('')}</tbody></table></div>`)}
+      ${carte(`Journal (${j.length})`, j.length ? `<ul class="liste-simple journal">${j.map(x => `<li><span class="heure">${fmtDate(x.date)}</span><span class="corps"><span><span class="badge ${niveaux[x.niveau] || ''}">${esc(x.flux)}</span></span><span>${esc(x.message)}</span></span></li>`).join('')}</ul>` : vide('Aucun flux déclenché pour l\'instant. Enregistrez un pré-diagnostic pour voir le premier.'))}`;
+  }
+
+  const VUES = {
+    accueil: vueAccueil, clients: vueClients, prediags: vuePrediags, opportunites: vueOpportunites,
+    affaires: vueAffaires, annuaire: vueAnnuaire, parametres: vueParametres, automatisations: vueAutomatisations
+  };
+  function rendre(garderDefilement) {
+    const y = window.scrollY;
+    rendreNav();
+    $('#vue').innerHTML = VUES[ui.vue]();
+    if (garderDefilement) window.scrollTo(0, y);
+  }
+  function aller(vue) {
+    ui.vue = vue;
+    ui.confirmerReset = false;
+    rendre();
+    window.scrollTo(0, 0);
+  }
+
+  /* =========================================================
+   * 7. Actions de l'interface
+   * ======================================================= */
+  function toast(message, type, titre) {
+    const t = document.createElement('div');
+    t.className = 'toast' + (type === 'erreur' ? ' erreur' : '');
+    t.innerHTML = `<b>${esc(titre || (type === 'erreur' ? 'Erreur' : 'Fait'))}</b>${esc(message)}`;
+    const pile = $('#toasts');
+    pile.appendChild(t);
+    while (pile.children.length > 3) pile.firstElementChild.remove();
+    setTimeout(() => t.remove(), 4500);
+  }
+  async function agir(nom, payload, messageOk) {
+    const avant = E().journal.length;
+    try {
+      const r = await Stockage.action(nom, payload);
+      const nouveaux = E().journal.slice(avant).filter(j => j.niveau !== 'info');
+      nouveaux.forEach(j => toast(j.message, j.niveau === 'alerte' ? 'erreur' : '', 'Power Automate · ' + j.flux));
+      if (messageOk && !nouveaux.length) toast(typeof messageOk === 'function' ? messageOk(r) : messageOk);
+      return r;
+    } catch (err) {
+      toast(err.message, 'erreur');
+      return null;
+    }
+  }
+
+  const clic = {
+    vue: b => { ui.clientId = null; ui.affaireId = null; aller(b.dataset.vue); },
+    ouvrirClient: b => { ui.clientId = b.dataset.id; ui.ongletClient = 'infos'; aller('clients'); },
+    retourClients: () => { ui.clientId = null; aller('clients'); },
+    ongletClient: b => { ui.ongletClient = b.dataset.onglet; rendre(true); },
+    nouveauPrediag: b => { ui.prediag = brouillonPrediag(b.dataset.id || ui.clientId); ui.dernierPrediag = null; aller('prediags'); },
+    chargerExemple: () => { ui.prediag = clone(SEED.exemplePrediag); ui.dernierPrediag = null; rendre(true); toast("Exemple chargé : regardez l'aperçu du moteur de règles, puis enregistrez.", '', 'Pré-diagnostic'); },
+    viderPrediag: () => { ui.prediag = brouillonPrediag(ui.prediag && ui.prediag.clientId); rendre(true); },
+    async enregistrerPrediag() {
+      const p = ui.prediag;
+      const r = await agir('enregistrerPrediag', p);
+      if (r) { ui.dernierPrediag = { clientId: p.clientId, crees: r.crees }; ui.prediag = brouillonPrediag(p.clientId); aller('prediags'); }
+    },
+    async ajouterInstallation() {
+      const r = await agir('ajouterInstallation', {
+        clientId: ui.clientId, type: $('#ins-type').value, puissance: $('#ins-p').value,
+        unite: $('#ins-u').value, annee: $('#ins-a').value, marque: $('#ins-m').value
+      }, 'Installation ajoutée au parc.');
+      if (r) rendre(true);
+    },
+    async statutOpp(b) { if (await agir('statutOpportunite', { id: b.dataset.id, statut: b.dataset.statut }, 'Opportunité mise à jour.')) rendre(true); },
+    async chiffrerOpp(b) {
+      const r = await agir('creerAffaire', { oppId: b.dataset.id });
+      if (r) { ui.affaireId = r.affaireId; ui.brouillonPour = null; aller('affaires'); }
+    },
+    ouvrirAffaire: b => { ui.affaireId = b.dataset.id; ui.brouillonPour = null; aller('affaires'); },
+    retourAffaires: () => { ui.affaireId = null; aller('affaires'); },
+    async etape(b) {
+      if (await agir('changerEtape', { id: b.dataset.id, etape: b.dataset.etape })) {
+        if (ui.affaireId === b.dataset.id) ui.brouillonPour = ui.modifie ? ui.brouillonPour : null;
+        rendre(true);
+      }
+    },
+    ajouterLigne: () => {
+      const p = E().produits[0];
+      ui.brouillon.lignes.push({ produitId: p.id, qte: 1 });
+      ui.modifie = true; rendre(true);
+    },
+    supprLigne: b => { ui.brouillon.lignes.splice(Number(b.dataset.i), 1); ui.modifie = true; rendre(true); },
+    base: b => { ui.brouillon.base = b.dataset.base; ui.modifie = true; rendre(true); },
+    async enregistrerChiffrage(b) {
+      if (await agir('majChiffrage', { id: b.dataset.id, chiffrage: ui.brouillon }, 'Chiffrage enregistré dans l\'affaire.')) {
+        ui.brouillonPour = null; rendre(true);
+      }
+    },
+    async enregistrerChantier(b) {
+      const id = b.dataset.id;
+      if (await agir('majChantier', { id, avancement: $('#av-' + id).value, reserve: $('#res-' + id).value }, 'Avancement enregistré.')) rendre(true);
+    },
+    async majParametres() {
+      if (await agir('majParametres', { margeDefaut: $('#p-marge').value, prixMWhCumac: $('#p-cumac').value }, 'Réglages enregistrés.')) rendre(true);
+    },
+    async importer() {
+      const texte = $('#csv-texte').value;
+      if (!texte.trim()) { toast('Choisissez un fichier CSV ou collez son contenu.', 'erreur'); return; }
+      const r = await agir('importerClients', { csv: texte }, x => `${x.importes} client(s) importé(s).`);
+      if (r) { toast(`${r.importes} client(s) importé(s) : ils apparaissent dans Clients.`, '', 'Import'); rendre(true); }
+    },
+    demanderReinit: () => { ui.confirmerReset = true; rendre(true); },
+    annulerReinit: () => { ui.confirmerReset = false; rendre(true); },
+    async reinit() {
+      if (await agir('reinitialiser', {}, 'Démonstration réinitialisée.')) {
+        Object.assign(ui, { clientId: null, affaireId: null, brouillonPour: null, prediag: null, dernierPrediag: null, confirmerReset: false });
+        aller('accueil');
+      }
+    }
+  };
+
+  const changement = {
+    filtreClient: el => { ui.filtresClients[el.dataset.champ] = el.value; rendre(true); },
+    filtreOpp: el => { ui.filtresOpp[el.dataset.champ] = el.value; rendre(true); },
+    pd: el => { ui.prediag[el.dataset.champ] = el.value; $('#apercu').innerHTML = apercuRegles(); },
+    question: el => { ui.prediag.valeurs[el.dataset.q] = el.value; $('#apercu').innerHTML = apercuRegles(); },
+    ligne: el => {
+      const l = ui.brouillon.lignes[Number(el.dataset.i)], prods = E().produits;
+      if (el.dataset.champ === 'categorie') {
+        const actuel = produit(l.produitId);
+        const p = prods.find(x => x.categorie === el.value && actuel && x.marque === actuel.marque) || prods.find(x => x.categorie === el.value);
+        if (p) l.produitId = p.id;
+      } else if (el.dataset.champ === 'marque') l.produitId = el.value;
+      ui.modifie = true; rendre(true);
+    },
+    aide: el => {
+      const id = el.dataset.aide, b = ui.brouillon;
+      if (el.checked) {
+        const ad = E().aides.find(x => x.id === id);
+        b.aides.push(ad.type === 'cee' ? { aideId: id, qte: 0 } : { aideId: id, montant: 0 });
+      } else b.aides = b.aides.filter(x => x.aideId !== id);
+      ui.modifie = true; rendre(true);
+    },
+    async seuilRegle(el) { if (await agir('majRegle', { id: el.dataset.id, seuil: el.value }, `Seuil de la règle ${el.dataset.id} mis à jour.`)) rendre(true); },
+    async actifRegle(el) { if (await agir('majRegle', { id: el.dataset.id, actif: el.checked }, `Règle ${el.dataset.id} ${el.checked ? 'activée' : 'désactivée'}.`)) rendre(true); },
+    async fichierCSV(el) {
+      const f = el.files && el.files[0];
+      if (!f) return;
+      const octets = await f.arrayBuffer();
+      let texte;
+      try { texte = new TextDecoder('utf-8', { fatal: true }).decode(octets); }
+      catch (e) { texte = new TextDecoder('windows-1252').decode(octets); }  // CSV Excel « classique »
+      $('#csv-texte').value = texte;
+    }
+  };
+  const saisie = {
+    filtreClient: el => {
+      ui.filtresClients.q = el.value;
+      const zone = $('#zone-clients');
+      if (!zone) return;
+      const tmp = document.createElement('div');
+      tmp.innerHTML = vueClients();
+      zone.replaceWith($('#zone-clients', tmp));
+    },
+    pd: changement.pd,
+    question: changement.question,
+    ligne: el => { ui.brouillon.lignes[Number(el.dataset.i)].qte = el.value; majCalculette(); },
+    chiffrage: el => { ui.brouillon[el.dataset.champ] = el.value; majCalculette(); },
+    aide: el => { const s = ui.brouillon.aides.find(x => x.aideId === el.dataset.aide); if (s) s[el.dataset.champ] = el.value; majCalculette(); },
+    avancement: el => { $('#avo-' + el.dataset.id).textContent = el.value; $('#avb-' + el.dataset.id).style.width = el.value + '%'; }
+  };
+
+  document.addEventListener('click', e => {
+    const b = e.target.closest('[data-act]');
+    if (!b || b.disabled) return;
+    const f = clic[b.dataset.act];
+    if (f) { e.preventDefault(); f(b); }
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const b = e.target.closest('g[data-act], tr[data-act]');
+    if (b && clic[b.dataset.act]) { e.preventDefault(); clic[b.dataset.act](b); }
+  });
+  document.addEventListener('change', e => {
+    const el = e.target.closest('[data-change]');
+    if (el && changement[el.dataset.change]) changement[el.dataset.change](el);
+  });
+  document.addEventListener('input', e => {
+    const el = e.target.closest('[data-input]');
+    if (el && saisie[el.dataset.input]) saisie[el.dataset.input](el);
+  });
+  $('#role').addEventListener('change', e => { ui.role = e.target.value; ecrireRole(ui.role); if (ui.vue === 'accueil' || ui.vue === 'parametres') rendre(); });
+
+  /* =========================================================
+   * 8. Démarrage
+   * ======================================================= */
+  // Exposé pour les tests de parité JS / Python.
+  window.Demo = { Moteur, Actions, etatInitial };
+
+  Stockage.demarrer().then(() => {
+    const h = (location.hash || '').slice(1);
+    if (VUES[h]) ui.vue = h;
+    rendre();
+  });
+})();

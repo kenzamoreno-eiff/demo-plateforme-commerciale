@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Plateforme commerciale Uptimum</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">PE</span>
+    <div class="brand-txt">
+      <strong>Plateforme commerciale</strong>
+      <span>Performance énergétique · DR Sud Alsace</span>
+    </div>
+  </div>
+  <div class="topbar-tools">
+    <label class="role-pick" for="role"><span>Profil</span>
+      <select id="role">
+        <option>Responsable d'affaires</option>
+        <option>Energy Expert</option>
+        <option>Conducteur de travaux</option>
+        <option>Cellule 3E</option>
+        <option>Direction de la DR</option>
+      </select>
+    </label>
+    <span id="mode" class="mode">Démarrage…</span>
+  </div>
+</header>
+<p class="demo-band">Démonstration avant Power Apps : prix, coefficients CEE et clients « Exemple » sont fictifs.</p>
+<div class="shell">
+  <nav id="nav" class="nav" aria-label="Espaces de la plateforme"></nav>
+  <main id="vue" class="vue" tabindex="-1"><p class="muted">Chargement de la démonstration…</p></main>
+</div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script src="seed.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
